@@ -9,6 +9,7 @@
 # not expressly granted therein are reserved by Shotgun Software Inc.
 
 import os
+import traceback
 
 from . import constants
 
@@ -86,6 +87,75 @@ class CachedConfiguration(Configuration):
             self._plugin_id,
             self._descriptor
         )
+
+    def verify_required_shotgun_fields(self):
+        """
+        Checks so that all shotgun fields required by the configuration
+        are present and valid.
+
+        Depending on the configuration, different checks are carried out.
+
+        For configurations using the template and schema system,
+        (e.g. has a roots.yml config file set),
+        checks are carried out to ensure Project.tank_name and
+        local storages are correctly set up.
+
+        This will download the config into the bundle cache if not already
+        done.
+
+        :raises: :class:`TankBootstrapError` if checks fail.
+        """
+        if self._project_id is None:
+            # site configuration. Nothing to check
+            return
+
+        # make sure the config is locally available.
+        self._descriptor.ensure_local()
+
+        log.debug(
+            "Verifying that all necessary shotgun data is "
+            "available in order for config %s to run..." % self
+        )
+
+        roots_data = None
+        roots_path = os.path.join(self._descriptor.get_path(), "core", constants.STORAGE_ROOTS_FILE)
+        if os.path.exists(roots_path):
+            with open(roots_path, "rt") as fh:
+                try:
+                    roots_data = yaml.load(fh)
+                except Exception:
+                    pass
+
+        if isinstance(roots_data, dict) and len(roots_data) > 0:
+            log.debug("Detected roots.yml with roots %s" % roots_data.keys())
+
+            log.debug("Ensuring that current project has a tank_name field...")
+            proj_data = self._sg_connection.find_one(
+                "Project",
+                [["id", "is", self._project_id]],
+                ["tank_name"]
+            )
+            if proj_data["tank_name"] is None:
+                raise TankBootstrapError(
+                    "The configuration requires you to specify a value "
+                    "for the Project.tank_name field in Shotgun."
+                )
+
+            # get all storages to ensure all roots are
+            log.debug("Ensuring that all required local storages exist in Shotgun.")
+            shotgun_storages = self._sg_connection.find("LocalStorage", [], ["code"])
+            shotgun_storage_names = [storage["code"] for storage in shotgun_storages]
+
+            # check that are required storages are defined in Shotgun
+            required_storage_names = roots_data.keys()
+            for required_storage_name in required_storage_names:
+                if required_storage_name not in shotgun_storage_names:
+
+                        storage_str = "storage" if len(required_storage_names) == 1 else "storages"
+                        raise TankBootstrapError(
+                            "The configuration requires the following local %s "
+                            "to be defined in Shotgun: %s" % (storage_str, ", ".join(required_storage_names))
+                        )
 
     def status(self):
         """
@@ -194,6 +264,23 @@ class CachedConfiguration(Configuration):
 
         # copy the configuration into place
         try:
+
+            # make sure the config is locally available.
+            self._descriptor.ensure_local()
+
+            # compatibility checks:
+            # if it's a shotgun descriptor type using id, ensure
+            # that the core we are switching *to* is more recent than 18.120
+            descriptor_dict = self._descriptor.get_dict()
+            if descriptor_dict["type"] == "shotgun" and "id" in descriptor_dict:
+                if self._descriptor.associated_core_version_less_than("v0.18.120"):
+                    raise TankBootstrapError(
+                        "Configurations uploaded to Shotgun must use core API "
+                        "version v0.18.120 or later. Please check the "
+                        "core/core_api.yml file in your configuration."
+                    )
+
+            # copy the descriptor payload across into the target install location
             self._descriptor.copy(os.path.join(self._path.current_os, "config"))
 
             # write out config files
@@ -218,7 +305,12 @@ class CachedConfiguration(Configuration):
             )
 
         except Exception as e:
-            log.exception("Failed to update configuration. Attempting Rollback. Error Traceback:")
+
+            log.debug(
+                "An exception was raised when trying to install the config descriptor %r. "
+                "Exception traceback details: %s" % (self._descriptor.get_uri(), traceback.format_exc())
+            )
+
             # step 1 - clear core and config locations
             log.debug("Cleaning out faulty config location...")
             # we're purposefully moving the bad pipeline configuration out of the way so we can restore
@@ -229,13 +321,19 @@ class CachedConfiguration(Configuration):
             if config_backup_path is None or core_backup_path is None:
                 # there is nothing to restore!
                 log.error(
-                    "Irrecoverable error - failed to update config but no previous config to "
-                    "fall back on. Raising TankBootstrapError to abort bootstrap."
+                    "Failed to install configuration %s. Error: %s. "
+                    "Cannot continue." % (self._descriptor.get_uri(), e)
                 )
                 raise TankBootstrapError("Configuration could not be installed: %s." % e)
 
             else:
                 # ok to restore
+
+                log.error(
+                    "Failed to install configuration %s. Will continue with "
+                    "the previous version instead. Error reported: %s" % (self._descriptor.get_uri(), e)
+                )
+
                 log.debug("Restoring previous config %s" % config_backup_path)
                 filesystem.copy_folder(
                     config_backup_path,
