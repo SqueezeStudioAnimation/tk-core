@@ -54,18 +54,19 @@ class IODescriptorRez(IODescriptorBase):
         self._validate_descriptor(
             descriptor_dict,
             required=["type", "name"],
-            optional=["version"]
+            optional=["version", "environment"]
         )
 
         self._name = descriptor_dict["name"]
 
-        
         self._version = descriptor_dict.get("version")
-        
+
         if self._version:
             # Shotgun expect version number to be prefixed with "v".
             # REZ don't, we'll support both but never pass the letter to rez.
             self._version = self._version.strip("v")
+
+        self._environment = descriptor_dict.get("environment")
 
         # Resolve location
         self._path = self._get_rez_pkg_location()
@@ -74,14 +75,17 @@ class IODescriptorRez(IODescriptorBase):
         
         request = "{0}-{1}".format(self._name, self._version) if self._version is not None else self._name
         log.debug("Resolved rez request is: {0}".format(request))
-        
+
+        cmd_env = os.environ.copy()
+        cmd_env["SQ_CONFIG_ENVIRONMENT"] = self._environment or ""
+
         if sys.platform == "win32":
             cmd = 'rez-env {pkg} -- echo %REZ_{NAME}_ROOT%'.format(pkg=request, NAME=self._name.upper())
         else:
             cmd = 'rez-env {pkg} -- printenv REZ_{NAME}_ROOT'.format(pkg=request, NAME=self._name.upper())
-            
+
         log.debug("Executing command: {0}".format(cmd))
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True, env=cmd_env)
         stdout, stderr = process.communicate()
         
         log.debug("stdout:\n{0}".format(stdout))
